@@ -262,8 +262,8 @@ class CausalGraphEngine:
         max_lag: int = 6,
         min_obs: int = 100,
         stability_splits: int = 4,
-        permutations_n: int = 48,
-        bootstrap_n: int = 48,
+        permutations_n: int = 199,
+        bootstrap_n: int = 199,
         walkforward_folds: int = 3,
         fdr_alpha: float = 0.10,
         random_state: int = 42,
@@ -424,9 +424,9 @@ class CausalGraphEngine:
     def _corr_pvalue(corr: float, n_obs: int) -> float:
         """Two-sided Fisher-z normal approximation for correlation.
 
-        This p-value is used only for FDR ranking. Circular-shift permutation,
-        moving-block bootstrap and walk-forward validation remain independent
-        safeguards against serial dependence and data-mining artifacts.
+        Used as a descriptive analytic p-value. FDR is intentionally applied
+        to pooled out-of-sample walk-forward p-values, not to this in-sample
+        approximation.
         """
         if not np.isfinite(corr) or int(n_obs) <= 3:
             return 1.0
@@ -534,7 +534,11 @@ class CausalGraphEngine:
             if test_end - train_end < 20:
                 continue
             train_idx = base.index[: max(0, train_end - self.max_lag)]
-            test_idx = base.index[train_end:test_end]
+            # Purge the tail of each test fold so y(t+lag) never crosses the
+            # nominal fold boundary. The train side is already embargoed by
+            # max_lag above.
+            purged_test_end = max(train_end, test_end - self.max_lag)
+            test_idx = base.index[train_end:purged_test_end]
             if len(train_idx) < self.min_obs or len(test_idx) < 20:
                 continue
 
@@ -676,12 +680,23 @@ class CausalGraphEngine:
             lag = int(cand["lag"])
             raw_corr = float(cand["raw_corr"])
 
+            # Rebuild this pair's discovery index; do not reuse the index from
+            # whichever pair happened to be processed last during discovery.
+            pair_base = pd.concat(
+                [returns[source].rename("x"), returns[target].rename("y")], axis=1
+            ).dropna()
+            pair_discovery_n = max(self.min_obs, int(len(pair_base) * 0.70))
+            pair_discovery_idx = pair_base.index[: max(0, pair_discovery_n - self.max_lag)]
+
             sx_cond, ty_cond, shared = self._conditional_series(
                 source,
                 target,
                 returns,
                 latent_strength,
-                fit_index=returns.index,
+                # Freeze factor betas on discovery data. This prevents the
+                # descriptive evidence metrics below from using full-sample
+                # factor estimates. Walk-forward still refits per fold.
+                fit_index=pair_discovery_idx,
             )
             aligned = self._align_lead(sx_cond, ty_cond, lag)
             if len(aligned) < self.min_obs:
@@ -808,6 +823,18 @@ class CausalGraphEngine:
             & (df["evidence_score"] >= 0.45)
         )
 
+        # Sequential survival counts make the evidence funnel explicit.
+        seq_fdr = fdr_pass
+        seq_perm = seq_fdr & perm_pass
+        seq_boot = seq_perm & bootstrap_pass
+        seq_wf = seq_boot & wf_pass
+        seq_stability = seq_wf & stability_pass
+        seq_decay = seq_stability & decay_pass
+        seq_score = seq_decay & (df["evidence_score"] >= 0.45)
+
+        finite_wfp = df.loc[np.isfinite(df["walkforward_p"]), "walkforward_p"]
+        finite_q = df.loc[np.isfinite(df["fdr_q"]), "fdr_q"]
+
         diagnostics = {
             "evaluated": int(len(df)),
             "fdr_pass": int(fdr_pass.sum()),
@@ -819,6 +846,17 @@ class CausalGraphEngine:
             "survivors": int(df["survives"].sum()),
             "survival_rate": float(df["survives"].mean()) if len(df) else 0.0,
             "fdr_alpha": self.fdr_alpha,
+            "min_walkforward_p": float(finite_wfp.min()) if len(finite_wfp) else np.nan,
+            "min_fdr_q": float(finite_q.min()) if len(finite_q) else np.nan,
+            "sequential": {
+                "fdr": int(seq_fdr.sum()),
+                "permutation": int(seq_perm.sum()),
+                "bootstrap": int(seq_boot.sum()),
+                "walkforward": int(seq_wf.sum()),
+                "stability": int(seq_stability.sum()),
+                "decay": int(seq_decay.sum()),
+                "evidence_score": int(seq_score.sum()),
+            },
         }
 
         df = (
