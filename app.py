@@ -12,8 +12,8 @@ from nexus_fx.intelligence import CausalGraphEngine, NetworkStressEngine, Regime
 from nexus_fx.latent import LatentCurrencyEngine
 from nexus_fx.universe import normalize_pair, split_pair
 
-APP_VERSION = "0.2.0"
-INTELLIGENCE_VERSION = "REGIME-CAUSAL-0.2.0"
+APP_VERSION = "0.2.1"
+INTELLIGENCE_VERSION = "STAT-HARDENED-0.2.1"
 
 
 class StructuralDiagnostics:
@@ -64,7 +64,7 @@ class StructuralDiagnostics:
         return pd.DataFrame(result, index=logs.index)
 
 
-st.set_page_config(page_title="NEXUS FX CORE v0.2", page_icon="◈", layout="wide")
+st.set_page_config(page_title="NEXUS FX CORE v0.2.1", page_icon="◈", layout="wide")
 
 st.markdown(
     """
@@ -83,7 +83,7 @@ st.markdown(
 )
 
 st.markdown('<div class="nexus-title">NEXUS FX CORE</div>', unsafe_allow_html=True)
-st.markdown('<div class="nexus-sub">Latent State · Regime Engine · Conditional Causal Graph · Network Stress</div>', unsafe_allow_html=True)
+st.markdown('<div class="nexus-sub">Latent State · Regime Reliability · FDR · Bootstrap · Walk-Forward · Network Stress</div>', unsafe_allow_html=True)
 st.caption(f"NEXUS v{APP_VERSION} · Intelligence {INTELLIGENCE_VERSION} · research prototype")
 
 DEFAULT_PAIRS = [
@@ -108,6 +108,9 @@ with st.expander("⚙️ Configuración", expanded=True):
         a1, a2 = st.columns(2)
         top_edges = a1.slider("Aristas candidatas a mostrar", 10, 40, 20, step=5)
         permutations_n = a2.slider("Permutaciones por arista", 16, 96, 48, step=16)
+        a3, a4 = st.columns(2)
+        bootstrap_n = a3.slider("Bootstrap por arista", 16, 96, 48, step=16)
+        fdr_alpha = a4.select_slider("FDR máximo (q)", options=[0.05, 0.075, 0.10, 0.15], value=0.10)
 
 
 @st.cache_data(ttl=55, show_spinner=False)
@@ -133,6 +136,9 @@ def analyze(close: pd.DataFrame):
             max_lag=max_lag,
             min_obs=80 if interval != "1d" else 60,
             permutations_n=permutations_n,
+            bootstrap_n=bootstrap_n,
+            walkforward_folds=3,
+            fdr_alpha=fdr_alpha,
         ).build(
             close,
             latent_strength=latent.strength,
@@ -154,15 +160,15 @@ if st.button("⚡ Construir estado del mercado", use_container_width=True, type=
         with st.spinner("Sincronizando FX, resolviendo estado latente, régimen y grafo condicional..."):
             close = get_data(tuple(pairs), period, interval)
             result = analyze(close)
-            st.session_state["nexus_v02_result"] = (close,) + result
+            st.session_state["nexus_v021_result"] = (close,) + result
     except Exception as exc:
         st.exception(exc)
 
-if "nexus_v02_result" not in st.session_state:
-    st.info("Pulsa “Construir estado del mercado”. v0.2 sigue siendo un laboratorio: no emite órdenes BUY/SELL.")
+if "nexus_v021_result" not in st.session_state:
+    st.info("Pulsa “Construir estado del mercado”. v0.2.1 endurece la evidencia estadística; sigue sin emitir órdenes BUY/SELL.")
     st.stop()
 
-close, latent, regime, graph, divergences, triangles, stress, graph_warning = st.session_state["nexus_v02_result"]
+close, latent, regime, graph, divergences, triangles, stress, graph_warning = st.session_state["nexus_v021_result"]
 if graph_warning:
     st.warning(graph_warning)
 
@@ -173,19 +179,25 @@ st.subheader("Estado global")
 reg_probs = regime.current_probabilities
 regime_name = regime.current_regime
 regime_conf = float(reg_probs.iloc[0]) if not reg_probs.empty else np.nan
+regime_reliability = regime.current_reliability
+graph_diag = graph.attrs.get("diagnostics", {}) if isinstance(graph, pd.DataFrame) else {}
+survivors = int(graph_diag.get("survivors", int(graph["survives"].sum()) if (not graph.empty and "survives" in graph) else 0))
+survival_rate = float(graph_diag.get("survival_rate", 0.0))
 
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 with m1:
-    st.markdown(f'<div class="card"><div class="metric-label">Régimen dominante</div><div class="big">{regime_name}</div><small>prob. {regime_conf:.1%}</small></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="card"><div class="metric-label">Régimen dominante</div><div class="big">{regime_name}</div><small>posterior {regime_conf:.1%}</small></div>', unsafe_allow_html=True)
 with m2:
+    rtxt = f"{regime_reliability:.1%}" if np.isfinite(regime_reliability) else "N/D"
+    st.markdown(f'<div class="card"><div class="metric-label">Fiabilidad régimen</div><div class="big">{rtxt}</div><small>autoconsistencia, no prob. calibrada</small></div>', unsafe_allow_html=True)
+with m3:
     pctl = stress.stress_percentile
     ptxt = f"{pctl:.0f}º" if np.isfinite(pctl) else "N/D"
     st.markdown(f'<div class="card"><div class="metric-label">Network stress</div><div class="big">{stress.current_stress:.2f}</div><small>percentil {ptxt}</small></div>', unsafe_allow_html=True)
-with m3:
-    st.markdown(f'<div class="card"><div class="metric-label">Coherencia triangular</div><div class="big">{stress.coherence:.1%}</div><small>1 = máxima coherencia</small></div>', unsafe_allow_html=True)
 with m4:
-    strong_edges = int(((graph["perm_p"] <= 0.10) & (graph["edge_score"] >= 0.25)).sum()) if not graph.empty else 0
-    st.markdown(f'<div class="card"><div class="metric-label">Aristas filtradas</div><div class="big">{strong_edges}</div><small>p≤0.10 y score≥0.25</small></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="card"><div class="metric-label">Coherencia triangular</div><div class="big">{stress.coherence:.1%}</div><small>1 = máxima coherencia</small></div>', unsafe_allow_html=True)
+with m5:
+    st.markdown(f'<div class="card"><div class="metric-label">Aristas sobrevivientes</div><div class="big">{survivors}</div><small>survival rate {survival_rate:.1%}</small></div>', unsafe_allow_html=True)
 
 if not reg_probs.empty:
     fig_reg = go.Figure(go.Bar(x=reg_probs.index, y=reg_probs.values))
@@ -213,37 +225,47 @@ for i, ccy in enumerate(strength_z.index):
             unsafe_allow_html=True,
         )
 
+# Cross-sectional standardization is numerically stable and directly answers
+# "which currency is strong relative to the rest right now?".
+strength_hist = latent.strength.copy().replace([np.inf, -np.inf], np.nan)
+cs_mean = strength_hist.mean(axis=1)
+cs_std = strength_hist.std(axis=1, ddof=0).replace(0.0, np.nan)
+strength_cs_z = strength_hist.sub(cs_mean, axis=0).div(cs_std, axis=0).clip(-5.0, 5.0).tail(350)
 fig = go.Figure()
-for ccy in latent.strength.columns:
-    rolling = latent.strength[ccy].rolling(120, min_periods=30)
-    z = (latent.strength[ccy] - rolling.mean()) / rolling.std(ddof=0).replace(0.0, np.nan)
-    fig.add_trace(go.Scatter(x=z.index, y=z, mode="lines", name=ccy))
-fig.update_layout(template="plotly_dark", height=430, margin=dict(l=20, r=20, t=35, b=20), title="Fuerza relativa estandarizada")
+for ccy in strength_cs_z.columns:
+    fig.add_trace(go.Scatter(x=strength_cs_z.index, y=strength_cs_z[ccy], mode="lines", name=ccy))
+fig.add_hline(y=0.0, line_width=1, opacity=0.35)
+fig.update_layout(template="plotly_dark", height=430, margin=dict(l=20, r=20, t=35, b=20), title="Fuerza relativa estandarizada (cross-section)", yaxis_title="σ relativo")
 st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # INTELLIGENCE TABS
 # -----------------------------------------------------------------------------
-t1, t2, t3, t4, t5 = st.tabs(["Grafo causal", "Régimen", "Divergencias", "Stress / Triángulos", "Diagnóstico"])
+t1, t2, t3, t4, t5 = st.tabs(["Grafo / Evidencia", "Régimen", "Divergencias", "Stress / Triángulos", "Diagnóstico"])
 
 with t1:
-    st.caption("Aristas temporales condicionales. Se elimina el factor de moneda compartida cuando es posible; perm_p es una prueba por desplazamiento circular. No demuestra causalidad económica.")
+    st.caption("v0.2.1 exige FDR, bootstrap, walk-forward, estabilidad y decay. Una arista sobreviviente sigue siendo una hipótesis predictiva, no causalidad económica demostrada.")
     if graph.empty:
         st.info("No hay aristas candidatas suficientes para esta muestra.")
     else:
+        only_survivors = st.toggle("Mostrar solo aristas sobrevivientes", value=False)
+        shown = graph.loc[graph["survives"]].copy() if only_survivors else graph.copy()
         display_cols = [
-            "source", "target", "lag", "shared_factor", "raw_corr", "conditional_corr",
-            "regime_corr", "stability", "perm_p", "incremental_r2", "edge_score", "n_obs",
+            "source", "target", "lag", "shared_factor", "conditional_corr",
+            "fdr_q", "bootstrap_low", "bootstrap_high", "walkforward_ic",
+            "walkforward_sign_rate", "walkforward_p", "walkforward_n", "stability", "decay_state",
+            "incremental_r2", "evidence_score", "survives", "n_obs",
         ]
-        st.dataframe(graph[display_cols], use_container_width=True, hide_index=True)
-        top = graph.head(12).copy()
-        top["edge"] = top["source"] + " → " + top["target"] + " (L" + top["lag"].astype(str) + ")"
-        fig_edges = go.Figure(go.Bar(x=top["edge_score"], y=top["edge"], orientation="h"))
-        fig_edges.update_layout(template="plotly_dark", height=max(350, 32 * len(top)), margin=dict(l=20, r=20, t=35, b=20), title="Candidate Edge Score", yaxis={"autorange": "reversed"})
-        st.plotly_chart(fig_edges, use_container_width=True)
+        st.dataframe(shown[display_cols], use_container_width=True, hide_index=True)
+        top = shown.head(12).copy()
+        if not top.empty:
+            top["edge"] = top["source"] + " → " + top["target"] + " (L" + top["lag"].astype(str) + ")"
+            fig_edges = go.Figure(go.Bar(x=top["evidence_score"], y=top["edge"], orientation="h"))
+            fig_edges.update_layout(template="plotly_dark", height=max(350, 32 * len(top)), margin=dict(l=20, r=20, t=35, b=20), title="NEXUS Evidence Score", yaxis={"autorange": "reversed"}, xaxis_range=[0, 1])
+            st.plotly_chart(fig_edges, use_container_width=True)
 
 with t2:
-    st.caption("El régimen es probabilístico. Una relación puede existir solo bajo un estado específico del mercado.")
+    st.caption("El posterior de régimen no está externamente calibrado. v0.2.1 añade entropía, persistencia y una métrica separada de fiabilidad/autoconsistencia.")
     if regime.probabilities.empty:
         st.info("No hay histórico suficiente para régimen.")
     else:
@@ -260,7 +282,7 @@ with t3:
     st.dataframe(divergences, use_container_width=True, hide_index=True)
 
 with t4:
-    st.caption("Network Stress estandariza las inconsistencias triangulares respecto a su propia historia. Un aumento coordinado es más importante que un residual aislado.")
+    st.caption("Network Stress estandariza inconsistencias triangulares contra su propia historia. Un aumento coordinado pesa más que un residual aislado.")
     if stress.series.empty:
         st.info("No hay suficientes triángulos para calcular stress.")
     else:
@@ -272,17 +294,30 @@ with t4:
             st.dataframe(latest_tri, use_container_width=True)
 
 with t5:
-    st.markdown("**Qué filtra v0.2 antes de aceptar una arista:**")
+    st.markdown("**Pipeline de evidencia v0.2.1:**")
     st.markdown(
-        "1. Busca el lag temporal más fuerte.  \n"
-        "2. Si ambos pares comparten moneda, residualiza ese factor latente.  \n"
-        "3. Mide estabilidad en bloques cronológicos.  \n"
-        "4. Compara contra un null de desplazamientos circulares (`perm_p`).  \n"
-        "5. Mide cuánto R² añade la fuente sobre la propia memoria del objetivo.  \n"
-        "6. Recalcula la correlación dentro del régimen dominante actual."
+        "1. Descubre el lag en el 70% inicial (con purga temporal).  \n"
+        "2. Residualiza la moneda compartida cuando existe.  \n"
+        "3. Mide estabilidad cronológica.  \n"
+        "4. Calcula `perm_p` con desplazamientos circulares.  \n"
+        "5. Corrige pruebas múltiples con Benjamini–Hochberg sobre p-values OOS (`fdr_q`).  \n"
+        "6. Exige intervalo bootstrap que no cruce cero.  \n"
+        "7. Valida en walk-forward fuera de la ventana de descubrimiento.  \n"
+        "8. Penaliza relaciones que muestran decay reciente.  \n"
+        "9. Combina las pruebas en `evidence_score`."
     )
-    st.warning("Una arista sobreviviente sigue siendo una hipótesis predictiva, no prueba de causalidad. La siguiente fase incorporará macro, yields, sesiones y datos point-in-time.")
+    d = graph_diag
+    if d:
+        dc1, dc2, dc3 = st.columns(3)
+        dc1.metric("Evaluadas", d.get("evaluated", 0))
+        dc2.metric("Pasan FDR", d.get("fdr_pass", 0))
+        dc3.metric("Pasan bootstrap", d.get("bootstrap_pass", 0))
+        dc4, dc5, dc6 = st.columns(3)
+        dc4.metric("Pasan walk-forward", d.get("walkforward_pass", 0))
+        dc5.metric("Sobreviven", d.get("survivors", 0))
+        dc6.metric("Edge Survival Rate", f"{d.get('survival_rate', 0.0):.1%}")
+    st.warning("FDR y walk-forward reducen falsos positivos, pero no convierten correlación temporal en causalidad. Antes de dinero real todavía faltan costes, spreads, slippage, macro point-in-time y backtest purgado completo.")
 
 st.divider()
 st.caption(f"Filas sincronizadas: {len(close):,} · Pares: {len(close.columns)} · Último dato: {close.index[-1]}")
-st.warning("NEXUS v0.2 es investigación estructural. No ejecuta operaciones ni recomienda apalancamiento.")
+st.warning("NEXUS v0.2.1 es investigación estadística estructural. No ejecuta operaciones ni recomienda apalancamiento.")
