@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# NEXUS FX CORE v0.2.2 — mobile-safe launcher.
+# NEXUS FX CORE v0.2.2.1 — compatibility fix.
 # Root Streamlit entry point. Keeps nexus_fx/app.py UI, removes its old
 # inline RegimeEngine/CausalGraphEngine classes, and imports v0.2.2 from
 # nexus_fx/intelligence.py. Also expands the diagnostics panel.
@@ -12,9 +12,19 @@ UI_FILE = Path(__file__).resolve().parent / "nexus_fx" / "app.py"
 
 source = UI_FILE.read_text(encoding="utf-8")
 
-source = source.replace("STAT-INLINE-0.2.1.1", "STAT-MODULE-0.2.2")
-source = source.replace("0.2.1.1", "0.2.2")
-source = source.replace("v0.2.1", "v0.2.2")
+source = source.replace("STAT-INLINE-0.2.1.1", "STAT-MODULE-0.2.2.1")
+source = source.replace("0.2.1.1", "0.2.2.1")
+source = source.replace("v0.2.1", "v0.2.2.1")
+
+source = source.replace(
+    "regime.current_reliability",
+    'getattr(regime, "current_reliability", np.nan)',
+)
+source = source.replace(
+    "regime.current_entropy",
+    'getattr(regime, "current_entropy", np.nan)',
+)
+
 
 needle = '        dc6.metric("Edge Survival Rate", f"{d.get(\'survival_rate\', 0.0):.1%}")'
 extra = """        dc6.metric("Edge Survival Rate", f"{d.get('survival_rate', 0.0):.1%}")
@@ -53,21 +63,68 @@ class RemoveOldEngines(ast.NodeTransformer):
 tree = RemoveOldEngines().visit(tree)
 ast.fix_missing_locations(tree)
 
-engine_import = ast.ImportFrom(
-    module="nexus_fx.intelligence",
-    names=[
-        ast.alias(name="RegimeEngine", asname=None),
-        ast.alias(name="CausalGraphEngine", asname=None),
-    ],
-    level=0,
+compat_code = """
+from nexus_fx.intelligence import (
+    RegimeEngine as _V022RegimeEngine,
+    CausalGraphEngine as _V022CausalGraphEngine,
 )
+
+class RegimeEngine(_V022RegimeEngine):
+    def fit(self, close, *args, **kwargs):
+        return super().fit(close)
+
+class CausalGraphEngine(_V022CausalGraphEngine):
+    def __init__(self, *args, **kwargs):
+        if "permutation_n" in kwargs and "permutations_n" not in kwargs:
+            kwargs["permutations_n"] = kwargs.pop("permutation_n")
+        super().__init__(*args, **kwargs)
+
+    def build(
+        self,
+        close,
+        latent_strength=None,
+        regime=None,
+        top_n=30,
+        permutations_n=None,
+        permutation_n=None,
+        bootstrap_n=None,
+        fdr_alpha=None,
+        *args,
+        **kwargs,
+    ):
+        old_perm = self.permutations_n
+        old_boot = self.bootstrap_n
+        old_fdr = self.fdr_alpha
+        try:
+            p = permutations_n if permutations_n is not None else permutation_n
+            if p is not None:
+                self.permutations_n = max(16, int(p))
+            if bootstrap_n is not None:
+                self.bootstrap_n = max(16, int(bootstrap_n))
+            if fdr_alpha is not None:
+                self.fdr_alpha = float(np.clip(fdr_alpha, 0.01, 0.25))
+            return super().build(
+                close,
+                latent_strength=latent_strength,
+                regime=regime,
+                top_n=top_n,
+            )
+        finally:
+            self.permutations_n = old_perm
+            self.bootstrap_n = old_boot
+            self.fdr_alpha = old_fdr
+"""
+
+compat_nodes = ast.parse(compat_code).body
 
 insert_at = 0
 for i, node in enumerate(tree.body):
     if isinstance(node, ast.ImportFrom) and node.module == "__future__":
         insert_at = i + 1
 
-tree.body.insert(insert_at, engine_import)
+for node in reversed(compat_nodes):
+    tree.body.insert(insert_at, node)
+
 ast.fix_missing_locations(tree)
 
 compiled = compile(tree, str(UI_FILE), "exec")
