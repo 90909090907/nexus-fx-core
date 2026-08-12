@@ -771,6 +771,7 @@ class CausalGraphEngine:
 
         df = pd.DataFrame(records)
         df["fdr_q"] = self._bh_qvalues(df["walkforward_p"].to_numpy(dtype=float))
+        df["fdr_q"] = df["fdr_q"].fillna(1.0).clip(0.0, 1.0)
 
         bootstrap_pass = (
             (df["bootstrap_low"] > 0) & (df["bootstrap_high"] > 0)
