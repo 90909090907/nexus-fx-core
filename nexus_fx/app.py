@@ -1013,8 +1013,8 @@ def analyze(close: pd.DataFrame):
             top_n=top_edges,
         )
     except Exception as exc:
-        graph = pd.DataFrame(columns=CausalGraphEngine.COLUMNS)
-        graph_warning = f"Grafo causal candidato desactivado por seguridad: {type(exc).__name__}: {exc}"
+               raise
+        
 
     return latent, regime, graph, divergences, triangles, stress, graph_warning
 
