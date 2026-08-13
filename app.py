@@ -423,6 +423,9 @@ with t6:
             st.caption("FDR → walk-forward → bootstrap → permutación → estabilidad → decay → score → probabilidad → trigger")
             st.json(seq)
 
+            st.markdown("### 🔎 Diagnóstico de candidatos")
+            st.json(graph_diag)
+
     st.warning("La probabilidad mostrada es una estimación empírica calibrada con los datos disponibles, no una garantía. Antes de dinero real siguen faltando costes, spread, slippage y validación independiente adicional.")
 
 st.divider()
