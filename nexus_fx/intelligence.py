@@ -561,7 +561,8 @@ class CausalGraphEngine:
         if n < self.min_obs:
             return 0.0
         vals: List[float] = []
-        for block in np.array_split(aligned, self.stability_splits):
+        for idx in np.array_split(np.arange(len(aligned)), self.stability_splits):
+        block = aligned.iloc[idx]
             if len(block) < 20:
                 continue
             c = self._corr(block["x"].to_numpy(), block["y_future"].to_numpy())
