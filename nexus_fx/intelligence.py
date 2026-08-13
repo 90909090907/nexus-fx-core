@@ -217,7 +217,7 @@ class RegimeEngine:
 class CausalGraphEngine:
     """Statistically hardened candidate lead/lag graph.
 
-    Safeguards in v0.2.1:
+    Safeguards in v0.2.2.6:
       * lag selection on a chronologically earlier discovery sample,
       * shared-currency factor residualization,
       * chronological stability,
@@ -515,71 +515,74 @@ class CausalGraphEngine:
         target: str,
         returns: pd.DataFrame,
         latent_strength: Optional[pd.DataFrame],
+        fixed_lag: int,
     ) -> Tuple[float, float, int, float, int]:
+        """Validate the frozen discovery hypothesis on the untouched final 30%.
+
+        Pair and lag are selected before this function is called. The lag is not
+        re-optimized in validation. Shared-factor betas are fitted only on the
+        discovery region and then applied unchanged to OOS observations.
+        """
         base = pd.concat([returns[source], returns[target]], axis=1).dropna()
         n = len(base)
         if n < max(self.min_obs, 120):
             return np.nan, 0.0, 0, 1.0, 0
 
-        test_size = max(30, n // 8)
-        first_train = max(self.min_obs, n - self.walkforward_folds * test_size)
+        discovery_n = max(self.min_obs, int(n * 0.70))
+        if discovery_n >= n - 20:
+            return np.nan, 0.0, 0, 1.0, 0
+
+        fit_end = max(0, discovery_n - self.max_lag)
+        fit_index = base.index[:fit_end]
+        if len(fit_index) < self.min_obs:
+            return np.nan, 0.0, 0, 1.0, 0
+
+        sx, ty, _ = self._conditional_series(
+            source, target, returns, latent_strength, fit_index=fit_index
+        )
+        aligned = self._align_lead(sx, ty, int(fixed_lag))
+
+        discovery_aligned = aligned.loc[aligned.index.intersection(fit_index)]
+        discovery_corr = self._corr(
+            discovery_aligned["x"].to_numpy(),
+            discovery_aligned["y_future"].to_numpy(),
+        )
+        if not np.isfinite(discovery_corr):
+            return np.nan, 0.0, 0, 1.0, 0
+
+        # The final 30% is untouched by pair/lag discovery.
+        oos_index = base.index[discovery_n:]
+        oos = aligned.loc[aligned.index.intersection(oos_index)]
+        if len(oos) < 40:
+            return np.nan, 0.0, 0, 1.0, 0
+
         fold_corrs: List[float] = []
-        train_signs: List[float] = []
         pooled_x: List[np.ndarray] = []
         pooled_y: List[np.ndarray] = []
-
-        for fold in range(self.walkforward_folds):
-            train_end = first_train + fold * test_size
-            test_end = min(n, train_end + test_size)
-            if test_end - train_end < 20:
+        for pos in np.array_split(np.arange(len(oos)), self.walkforward_folds):
+            if len(pos) < 20:
                 continue
-            train_idx = base.index[: max(0, train_end - self.max_lag)]
-            # Purge the tail of each test fold so y(t+lag) never crosses the
-            # nominal fold boundary. The train side is already embargoed by
-            # max_lag above.
-            purged_test_end = max(train_end, test_end - self.max_lag)
-            test_idx = base.index[train_end:purged_test_end]
-            if len(train_idx) < self.min_obs or len(test_idx) < 20:
+            block = oos.iloc[pos]
+            # Purge the fold tail so y(t+lag) never crosses the fold boundary.
+            if int(fixed_lag) > 0 and len(block) > int(fixed_lag) + 20:
+                block = block.iloc[:-int(fixed_lag)]
+            if len(block) < 20:
                 continue
-
-            sx, ty, _ = self._conditional_series(
-                source, target, returns, latent_strength, fit_index=train_idx
-            )
-
-            best_lag = None
-            best_corr = None
-            for lag in range(1, self.max_lag + 1):
-                aligned = self._align_lead(sx, ty, lag)
-                train_aligned = aligned.loc[aligned.index.intersection(train_idx)]
-                c = self._corr(train_aligned["x"].to_numpy(), train_aligned["y_future"].to_numpy())
-                if not np.isfinite(c):
-                    continue
-                if best_corr is None or abs(c) > abs(best_corr):
-                    best_corr = float(c)
-                    best_lag = lag
-            if best_lag is None or best_corr is None:
+            x = block["x"].to_numpy(dtype=float)
+            y = block["y_future"].to_numpy(dtype=float)
+            c = self._corr(x, y)
+            if not np.isfinite(c):
                 continue
-
-            aligned = self._align_lead(sx, ty, best_lag)
-            test_aligned = aligned.loc[aligned.index.intersection(test_idx)]
-            x = test_aligned["x"].to_numpy(dtype=float)
-            y = test_aligned["y_future"].to_numpy(dtype=float)
-            c_test = self._corr(x, y)
-            if np.isfinite(c_test):
-                fold_corrs.append(float(c_test))
-                train_signs.append(float(np.sign(best_corr)))
-                # Pool within-fold standardized OOS observations so FDR is driven
-                # by truly unseen data rather than the lag-discovery sample.
-                if len(x) >= 20 and np.std(x) > 1e-15 and np.std(y) > 1e-15:
-                    pooled_x.append((x - np.mean(x)) / np.std(x))
-                    pooled_y.append((y - np.mean(y)) / np.std(y))
+            fold_corrs.append(float(c))
+            if np.std(x) > 1e-15 and np.std(y) > 1e-15:
+                pooled_x.append((x - np.mean(x)) / np.std(x))
+                pooled_y.append((y - np.mean(y)) / np.std(y))
 
         if not fold_corrs:
             return np.nan, 0.0, 0, 1.0, 0
-        median_ic = float(np.median(fold_corrs))
-        sign_hits = [np.sign(c) == train_signs[i] for i, c in enumerate(fold_corrs)]
-        sign_rate = float(np.mean(sign_hits)) if sign_hits else 0.0
 
+        median_ic = float(np.median(fold_corrs))
+        sign_rate = float(np.mean(np.sign(fold_corrs) == np.sign(discovery_corr)))
         if pooled_x:
             px = np.concatenate(pooled_x)
             py = np.concatenate(pooled_y)
@@ -715,6 +718,7 @@ class CausalGraphEngine:
                 target,
                 returns,
                 latent_strength,
+                fixed_lag=lag,
             )
             decay_score, decay_state = self._decay(aligned)
 
