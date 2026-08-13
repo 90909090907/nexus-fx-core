@@ -182,6 +182,7 @@ def analyze(close: pd.DataFrame):
             allowed_pairs=tuple(FIXED_PAIRS),
         )
     except Exception as exc:
+        raise
         graph = pd.DataFrame(columns=CausalGraphEngine.COLUMNS)
         graph_warning = f"Motor multietapa desactivado por seguridad: {type(exc).__name__}: {exc}"
 
