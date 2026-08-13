@@ -560,23 +560,55 @@ class CausalGraphEngine:
         n = len(aligned)
         if n < self.min_obs:
             return 0.0
+
         vals: List[float] = []
-        for idx in np.array_split(np.arange(len(aligned)), self.stability_splits):
-        block = aligned.iloc[idx]
+        splits = np.array_split(
+            np.arange(n, dtype=int),
+            self.stability_splits,
+        )
+
+        for idx in splits:
+            if len(idx) == 0:
+                continue
+
+            block = aligned.iloc[idx].copy()
             if len(block) < 20:
                 continue
-            c = self._corr(block["x"].to_numpy(), block["y_future"].to_numpy())
+
+            x_vals = block["x"].to_numpy(dtype=float)
+            y_vals = block["y_future"].to_numpy(dtype=float)
+            c = self._corr(x_vals, y_vals)
+
             if np.isfinite(c):
                 vals.append(float(c))
+
         if len(vals) < 2:
             return 0.0
-        gc = self._corr(aligned["x"].to_numpy(), aligned["y_future"].to_numpy())
+
+        gc = self._corr(
+            aligned["x"].to_numpy(dtype=float),
+            aligned["y_future"].to_numpy(dtype=float),
+        )
         if not np.isfinite(gc) or abs(gc) < 1e-12:
             return 0.0
+
         sign_consistency = float(np.mean(np.sign(vals) == np.sign(gc)))
-        magnitude_consistency = float(np.clip(np.median(np.abs(vals)) / abs(gc), 0.0, 1.0))
-        variability_penalty = float(np.exp(-np.std(vals) / (abs(gc) + 1e-6)))
-        return float(np.clip(sign_consistency * magnitude_consistency * variability_penalty, 0.0, 1.0))
+        magnitude_consistency = float(
+            np.clip(np.median(np.abs(vals)) / abs(gc), 0.0, 1.0)
+        )
+        variability_penalty = float(
+            np.exp(-np.std(vals) / (abs(gc) + 1e-6))
+        )
+
+        return float(
+            np.clip(
+                sign_consistency
+                * magnitude_consistency
+                * variability_penalty,
+                0.0,
+                1.0,
+            )
+        )
 
     @staticmethod
     def _r2(y: np.ndarray, X: np.ndarray) -> float:
@@ -615,44 +647,102 @@ class CausalGraphEngine:
         return score, ("LOW" if score >= 0.8 else "MEDIUM" if score >= 0.5 else "HIGH")
 
     def _oos_validation(
-        self, source: str, target: str, lag: int, returns: pd.DataFrame,
-        latent_strength: Optional[pd.DataFrame], discovery_n: int,
+        self,
+        source: str,
+        target: str,
+        lag: int,
+        returns: pd.DataFrame,
+        latent_strength: Optional[pd.DataFrame],
+        discovery_n: int,
     ) -> Dict[str, object]:
         base = pd.concat([returns[source], returns[target]], axis=1).dropna()
+
         fit_end = max(0, discovery_n - self.max_lag)
         fit_index = base.index[:fit_end]
         if len(fit_index) < self.min_obs:
             return {}
-        sx, ty, _ = self._conditional_series(source, target, returns, latent_strength, fit_index)
+
+        sx, ty, _ = self._conditional_series(
+            source,
+            target,
+            returns,
+            latent_strength,
+            fit_index,
+        )
         aligned = self._align_lead(sx, ty, lag)
+
         train = aligned.loc[aligned.index.intersection(fit_index)]
-        train_corr = self._corr(train["x"].to_numpy(), train["y_future"].to_numpy())
+        train_corr = self._corr(
+            train["x"].to_numpy(dtype=float),
+            train["y_future"].to_numpy(dtype=float),
+        )
+
         oos_index = base.index[discovery_n:]
-        oos = aligned.loc[aligned.index.intersection(oos_index)]
+        oos = aligned.loc[aligned.index.intersection(oos_index)].copy()
+
         if not np.isfinite(train_corr) or len(oos) < 40:
             return {}
 
         fold_corrs: List[float] = []
-        for block in np.array_split(oos, self.walkforward_folds):
+        fold_indices = np.array_split(
+            np.arange(len(oos), dtype=int),
+            self.walkforward_folds,
+        )
+
+        for idx in fold_indices:
+            if len(idx) == 0:
+                continue
+
+            block = oos.iloc[idx].copy()
+
             if lag > 0 and len(block) > lag + 20:
                 block = block.iloc[:-lag]
+
             if len(block) < 20:
                 continue
-            c = self._corr(block["x"].to_numpy(), block["y_future"].to_numpy())
+
+            c = self._corr(
+                block["x"].to_numpy(dtype=float),
+                block["y_future"].to_numpy(dtype=float),
+            )
             if np.isfinite(c):
                 fold_corrs.append(float(c))
+
         if not fold_corrs:
             return {}
 
-        oos_corr = self._corr(oos["x"].to_numpy(), oos["y_future"].to_numpy())
-        oos_p = self._corr_pvalue(oos_corr, len(oos)) if np.isfinite(oos_corr) else 1.0
-        sign_rate = float(np.mean(np.sign(fold_corrs) == np.sign(train_corr)))
-        pred_sign = np.sign(train_corr) * np.sign(oos["x"].to_numpy(dtype=float))
-        actual_sign = np.sign(oos["y_future"].to_numpy(dtype=float))
-        valid = (pred_sign != 0) & (actual_sign != 0) & np.isfinite(pred_sign) & np.isfinite(actual_sign)
+        oos_corr = self._corr(
+            oos["x"].to_numpy(dtype=float),
+            oos["y_future"].to_numpy(dtype=float),
+        )
+        oos_p = (
+            self._corr_pvalue(oos_corr, len(oos))
+            if np.isfinite(oos_corr)
+            else 1.0
+        )
+
+        sign_rate = float(
+            np.mean(np.sign(fold_corrs) == np.sign(train_corr))
+        )
+
+        pred_sign = np.sign(train_corr) * np.sign(
+            oos["x"].to_numpy(dtype=float)
+        )
+        actual_sign = np.sign(
+            oos["y_future"].to_numpy(dtype=float)
+        )
+
+        valid = (
+            (pred_sign != 0)
+            & (actual_sign != 0)
+            & np.isfinite(pred_sign)
+            & np.isfinite(actual_sign)
+        )
+
         hits = int(np.sum(pred_sign[valid] == actual_sign[valid]))
         trials = int(np.sum(valid))
         accuracy = float(hits / trials) if trials else np.nan
+
         return {
             "oos": oos,
             "train_corr": float(train_corr),
