@@ -214,7 +214,7 @@ class RegimeEngine:
         return RegimeResult(probabilities=probabilities, dominant=dominant, metrics=metrics)
 
 
-ENGINE_VERSION = "MULTISTAGE-0.3.0"
+ENGINE_VERSION = "MULTISTAGE-0.3.1"
 CORE_PAIRS: Tuple[str, ...] = (
     "AUDUSD", "EURCHF", "EURGBP", "EURJPY",
     "EURUSD", "GBPCHF", "GBPJPY", "GBPUSD",
@@ -232,12 +232,15 @@ class MemoryStats:
 
 
 class EvidenceMemoryEngine:
-    """Small durable experiment ledger.
+    """Durable experiment/signal ledger.
 
-    The default SQLite file is local to the deployment. On ephemeral hosts the
-    file survives normal reruns but can be lost on redeploy/rebuild. The path
-    can be redirected with NEXUS_MEMORY_PATH to a persistent volume later.
+    ``EXPERIMENT`` rows accumulate research outcomes without relaxing the
+    official BUY/SELL rules. ``SIGNAL`` rows are only official decisions.
+    Experimental memory is exposed separately and never enters the official
+    probability used by decision_mask.
     """
+
+    VALID_KINDS = ("EXPERIMENT", "SIGNAL")
 
     def __init__(self, path: Optional[str] = None) -> None:
         import os
@@ -245,7 +248,10 @@ class EvidenceMemoryEngine:
         from pathlib import Path
 
         self.sqlite3 = sqlite3
-        default_path = os.environ.get("NEXUS_MEMORY_PATH", ".nexus_state/nexus_memory.sqlite3")
+        default_path = os.environ.get(
+            "NEXUS_MEMORY_PATH",
+            ".nexus_state/nexus_memory.sqlite3",
+        )
         self.path = Path(path or default_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -279,18 +285,39 @@ class EvidenceMemoryEngine:
                     signed_return REAL,
                     hit INTEGER,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    kind TEXT NOT NULL DEFAULT 'SIGNAL',
                     UNIQUE(signal_time, source, target, lag, interval, direction)
                 )
                 """
             )
+
+            columns = {
+                str(row[1])
+                for row in con.execute("PRAGMA table_info(signals)").fetchall()
+            }
+            if "kind" not in columns:
+                con.execute(
+                    "ALTER TABLE signals "
+                    "ADD COLUMN kind TEXT NOT NULL DEFAULT 'SIGNAL'"
+                )
+
             con.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memory_key ON signals(source,target,lag,interval,regime,status)"
+                "CREATE INDEX IF NOT EXISTS idx_memory_key "
+                "ON signals(source,target,lag,interval,regime,status)"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_kind "
+                "ON signals(kind,status,source,target,lag,interval)"
             )
 
     @staticmethod
     def _time_key(value) -> str:
-        ts = pd.Timestamp(value)
-        return ts.isoformat()
+        return pd.Timestamp(value).isoformat()
+
+    @classmethod
+    def _normalize_kind(cls, kind: str) -> str:
+        value = str(kind).upper().strip()
+        return value if value in cls.VALID_KINDS else "EXPERIMENT"
 
     def record_signal(
         self,
@@ -305,60 +332,130 @@ class EvidenceMemoryEngine:
         evidence_score: float,
         reference_price: float,
         horizon_bars: int,
+        kind: str = "SIGNAL",
     ) -> None:
+        kind = self._normalize_kind(kind)
+        key = (
+            self._time_key(signal_time),
+            str(source),
+            str(target),
+            int(lag),
+            str(interval),
+            str(direction),
+        )
+
         with self._connect() as con:
             con.execute(
                 """
                 INSERT OR IGNORE INTO signals(
                     signal_time,source,target,lag,interval,regime,direction,
-                    probability,evidence_score,reference_price,horizon_bars,status
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'OPEN')
+                    probability,evidence_score,reference_price,horizon_bars,
+                    status,kind
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'OPEN',?)
                 """,
                 (
-                    self._time_key(signal_time), str(source), str(target), int(lag),
-                    str(interval), str(regime), str(direction), float(probability),
-                    float(evidence_score), float(reference_price), int(horizon_bars),
+                    key[0], key[1], key[2], key[3], key[4],
+                    str(regime), key[5], float(probability),
+                    float(evidence_score), float(reference_price),
+                    int(horizon_bars), kind,
                 ),
             )
+
+            if kind == "SIGNAL":
+                con.execute(
+                    """
+                    UPDATE signals
+                    SET kind='SIGNAL',
+                        regime=?,
+                        probability=?,
+                        evidence_score=?,
+                        reference_price=?,
+                        horizon_bars=?
+                    WHERE signal_time=? AND source=? AND target=? AND lag=?
+                      AND interval=? AND direction=?
+                    """,
+                    (
+                        str(regime), float(probability), float(evidence_score),
+                        float(reference_price), int(horizon_bars),
+                        key[0], key[1], key[2], key[3], key[4], key[5],
+                    ),
+                )
 
     def settle(self, close: pd.DataFrame, interval: str) -> int:
         if close is None or close.empty:
             return 0
+
         work = close.copy().sort_index()
         idx = pd.DatetimeIndex(work.index)
         settled = 0
+
         with self._connect() as con:
             rows = con.execute(
-                """SELECT id,signal_time,target,direction,reference_price,horizon_bars
-                   FROM signals WHERE status='OPEN' AND interval=? ORDER BY id""",
+                """
+                SELECT id,signal_time,target,direction,reference_price,horizon_bars
+                FROM signals
+                WHERE status='OPEN' AND interval=?
+                ORDER BY id
+                """,
                 (str(interval),),
             ).fetchall()
+
             for row_id, signal_time, target, direction, ref_price, horizon_bars in rows:
                 if target not in work.columns:
                     continue
+
                 ts = pd.Timestamp(signal_time)
                 if idx.tz is not None and ts.tzinfo is None:
                     ts = ts.tz_localize(idx.tz)
                 elif idx.tz is None and ts.tzinfo is not None:
                     ts = ts.tz_convert(None)
+
                 pos = int(idx.searchsorted(ts, side="left"))
                 if pos >= len(idx):
                     continue
+
                 outcome_pos = pos + int(horizon_bars)
                 if outcome_pos >= len(idx):
                     continue
-                outcome_price = pd.to_numeric(work[target], errors="coerce").iloc[outcome_pos]
-                if not np.isfinite(outcome_price) or not np.isfinite(ref_price) or float(ref_price) <= 0:
+
+                outcome_price = pd.to_numeric(
+                    work[target],
+                    errors="coerce",
+                ).iloc[outcome_pos]
+
+                if (
+                    not np.isfinite(outcome_price)
+                    or not np.isfinite(ref_price)
+                    or float(ref_price) <= 0
+                ):
                     continue
+
                 raw_ret = float(outcome_price / float(ref_price) - 1.0)
-                signed_ret = raw_ret if str(direction).upper() == "BUY" else -raw_ret
+                signed_ret = (
+                    raw_ret if str(direction).upper() == "BUY" else -raw_ret
+                )
                 hit = int(signed_ret > 0.0)
+
                 con.execute(
-                    """UPDATE signals SET status='CLOSED', outcome_time=?, outcome_price=?,
-                       signed_return=?, hit=? WHERE id=?""",
-                    (self._time_key(idx[outcome_pos]), float(outcome_price), signed_ret, hit, row_id),
+                    """
+                    UPDATE signals
+                    SET status='CLOSED',
+                        outcome_time=?,
+                        outcome_price=?,
+                        signed_return=?,
+                        hit=?
+                    WHERE id=?
+                    """,
+                    (
+                        self._time_key(idx[outcome_pos]),
+                        float(outcome_price),
+                        signed_ret,
+                        hit,
+                        row_id,
+                    ),
                 )
                 settled += 1
+
         return settled
 
     def stats(
@@ -369,35 +466,62 @@ class EvidenceMemoryEngine:
         interval: str,
         regime: Optional[str] = None,
         recent_n: int = 100,
+        kind: Optional[str] = None,
     ) -> MemoryStats:
-        where = "source=? AND target=? AND lag=? AND interval=? AND status='CLOSED'"
-        params: List[object] = [str(source), str(target), int(lag), str(interval)]
+        where = (
+            "source=? AND target=? AND lag=? "
+            "AND interval=? AND status='CLOSED'"
+        )
+        params: List[object] = [
+            str(source),
+            str(target),
+            int(lag),
+            str(interval),
+        ]
+
         if regime and regime != "UNKNOWN":
             where += " AND regime=?"
             params.append(str(regime))
+
+        if kind:
+            where += " AND kind=?"
+            params.append(self._normalize_kind(kind))
+
         with self._connect() as con:
             total = con.execute(
-                f"SELECT COUNT(*), COALESCE(SUM(hit),0) FROM signals WHERE {where}", params
+                f"SELECT COUNT(*), COALESCE(SUM(hit),0) "
+                f"FROM signals WHERE {where}",
+                params,
             ).fetchone()
+
             recent = con.execute(
-                f"SELECT hit FROM signals WHERE {where} ORDER BY id DESC LIMIT ?",
+                f"SELECT hit FROM signals WHERE {where} "
+                f"ORDER BY id DESC LIMIT ?",
                 params + [int(recent_n)],
             ).fetchall()
-        trials, hits = int(total[0]), int(total[1])
+
+        trials = int(total[0])
+        hits = int(total[1])
         recent_trials = len(recent)
         recent_hits = int(sum(int(r[0]) for r in recent)) if recent else 0
+
         return MemoryStats(
             trials=trials,
             hits=hits,
             hit_rate=(hits / trials) if trials else np.nan,
             recent_trials=recent_trials,
             recent_hits=recent_hits,
-            recent_hit_rate=(recent_hits / recent_trials) if recent_trials else np.nan,
+            recent_hit_rate=(
+                recent_hits / recent_trials if recent_trials else np.nan
+            ),
         )
 
     def export_frame(self) -> pd.DataFrame:
         with self._connect() as con:
-            return pd.read_sql_query("SELECT * FROM signals ORDER BY id", con)
+            return pd.read_sql_query(
+                "SELECT * FROM signals ORDER BY id",
+                con,
+            )
 
 
 class CausalGraphEngine:
@@ -421,6 +545,7 @@ class CausalGraphEngine:
         "incremental_r2", "decay_score", "decay_state", "evidence_score",
         "edge_score", "survives", "n_obs", "oos_accuracy", "oos_hits",
         "oos_trials", "probability_raw", "memory_probability",
+        "signal_memory_trials", "research_probability", "research_trials",
         "predicted_probability", "probability_lower_95", "trigger_z",
         "signal_direction", "decision", "horizon_bars", "stage",
     ]
@@ -962,6 +1087,9 @@ class CausalGraphEngine:
         df["regime_corr"] = np.nan
         df["probability_raw"] = np.nan
         df["memory_probability"] = np.nan
+        df["signal_memory_trials"] = 0
+        df["research_probability"] = np.nan
+        df["research_trials"] = 0
         df["predicted_probability"] = np.nan
         df["probability_lower_95"] = np.nan
         df["trigger_z"] = np.nan
@@ -988,23 +1116,71 @@ class CausalGraphEngine:
         df["edge_score"] = df["evidence_score"]
 
         for idx, row in df.iterrows():
-            mem = self.memory.stats(
-                str(row.source), str(row.target), int(row.lag), interval, current_regime
-            ) if self.memory is not None else MemoryStats()
+            if self.memory is not None:
+                signal_mem = self.memory.stats(
+                    str(row.source),
+                    str(row.target),
+                    int(row.lag),
+                    interval,
+                    current_regime,
+                    kind="SIGNAL",
+                )
+                research_mem = self.memory.stats(
+                    str(row.source),
+                    str(row.target),
+                    int(row.lag),
+                    interval,
+                    current_regime,
+                    kind="EXPERIMENT",
+                )
+            else:
+                signal_mem = MemoryStats()
+                research_mem = MemoryStats()
+
+            # Official decision probability: OOS + official SIGNAL memory only.
             hist_prob, mem_prob, pred_prob, lower = self._calibrate_probability(
-                float(row.oos_accuracy), int(row.oos_hits), int(row.oos_trials), mem
+                float(row.oos_accuracy),
+                int(row.oos_hits),
+                int(row.oos_trials),
+                signal_mem,
             )
-            trigger_z = self._latest_trigger_z(returns, str(row.source))
+
+            # Research memory is diagnostic only; it cannot create a BUY/SELL.
+            _, research_prob, _, _ = self._calibrate_probability(
+                float(row.oos_accuracy),
+                int(row.oos_hits),
+                int(row.oos_trials),
+                research_mem,
+            )
+
+            trigger_z = self._latest_trigger_z(
+                returns,
+                str(row.source),
+            )
+
             df.loc[idx, "probability_raw"] = hist_prob
             df.loc[idx, "memory_probability"] = mem_prob
+            df.loc[idx, "signal_memory_trials"] = int(signal_mem.trials)
+            df.loc[idx, "research_probability"] = research_prob
+            df.loc[idx, "research_trials"] = int(research_mem.trials)
             df.loc[idx, "predicted_probability"] = pred_prob
             df.loc[idx, "probability_lower_95"] = lower
             df.loc[idx, "trigger_z"] = trigger_z
 
             direction = "NONE"
             if np.isfinite(trigger_z) and abs(trigger_z) >= self.trigger_z_min:
-                impulse = np.sign(float(row.conditional_corr)) * np.sign(trigger_z)
-                direction = "BUY" if impulse > 0 else "SELL" if impulse < 0 else "NONE"
+                impulse = (
+                    np.sign(float(row.conditional_corr))
+                    * np.sign(trigger_z)
+                )
+                direction = (
+                    "BUY"
+                    if impulse > 0
+                    else "SELL"
+                    if impulse < 0
+                    else "NONE"
+                )
+
             df.loc[idx, "signal_direction"] = direction
 
         hard_survive = (
@@ -1022,19 +1198,64 @@ class CausalGraphEngine:
         df.loc[hard_survive, "stage"] = "SURVIVOR"
         df.loc[decision_mask, "stage"] = "SIGNAL"
 
-        # Register signals before their outcomes are known.
+        # Research candidates are recorded separately from official signals.
+        # This creates learning data without lowering any production threshold.
+        research_mask = (
+            (df["signal_direction"] != "NONE")
+            & (df["oos_trials"].fillna(0) >= 40)
+            & (df["walkforward_sign_rate"].fillna(0.0) >= (2.0 / 3.0))
+            & (df["walkforward_ic"].abs().fillna(0.0) >= 0.03)
+            & (df["evidence_score"].fillna(0.0) >= 0.20)
+            & (~decision_mask)
+        )
+
         if self.memory is not None and len(close.index):
             signal_time = close.index[-1]
-            for _, row in df.loc[decision_mask].iterrows():
-                ref = pd.to_numeric(close[str(row.target)], errors="coerce").dropna()
+
+            for _, row in df.loc[research_mask].iterrows():
+                ref = pd.to_numeric(
+                    close[str(row.target)],
+                    errors="coerce",
+                ).dropna()
                 if ref.empty:
                     continue
+
                 self.memory.record_signal(
-                    signal_time=signal_time, source=str(row.source), target=str(row.target),
-                    lag=int(row.lag), interval=interval, regime=current_regime,
-                    direction=str(row.decision), probability=float(row.predicted_probability),
-                    evidence_score=float(row.evidence_score), reference_price=float(ref.iloc[-1]),
+                    signal_time=signal_time,
+                    source=str(row.source),
+                    target=str(row.target),
+                    lag=int(row.lag),
+                    interval=interval,
+                    regime=current_regime,
+                    direction=str(row.signal_direction),
+                    probability=float(row.predicted_probability),
+                    evidence_score=float(row.evidence_score),
+                    reference_price=float(ref.iloc[-1]),
                     horizon_bars=int(row.horizon_bars),
+                    kind="EXPERIMENT",
+                )
+
+            for _, row in df.loc[decision_mask].iterrows():
+                ref = pd.to_numeric(
+                    close[str(row.target)],
+                    errors="coerce",
+                ).dropna()
+                if ref.empty:
+                    continue
+
+                self.memory.record_signal(
+                    signal_time=signal_time,
+                    source=str(row.source),
+                    target=str(row.target),
+                    lag=int(row.lag),
+                    interval=interval,
+                    regime=current_regime,
+                    direction=str(row.decision),
+                    probability=float(row.predicted_probability),
+                    evidence_score=float(row.evidence_score),
+                    reference_price=float(ref.iloc[-1]),
+                    horizon_bars=int(row.horizon_bars),
+                    kind="SIGNAL",
                 )
 
         seq_fdr = fdr_pass
@@ -1057,6 +1278,7 @@ class CausalGraphEngine:
             "stage4_heavy": int(finalists.sum()),
             "survivors": int(hard_survive.sum()),
             "signals": int(decision_mask.sum()),
+            "research_candidates": int(research_mask.sum()),
             "probability_threshold": self.probability_threshold,
             "fdr_alpha": self.fdr_alpha,
             "best_probability": float(df["predicted_probability"].max()) if len(df) else np.nan,
