@@ -4,3 +4,4 @@ numpy>=1.26
 plotly>=5.20
 yfinance>=0.2.50
 pytest>=8.0
+supabase>=2.0.0
