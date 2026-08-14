@@ -392,6 +392,27 @@ with t5:
         st.warning(f"No se pudo leer la memoria: {type(exc).__name__}: {exc}")
 
 with t6:
+    # Diagnóstico de persistencia: no muestra valores de URL ni claves secretas.
+    memory_debug = get_memory()
+    st.markdown("### 🗄️ Diagnóstico Supabase")
+    remote_enabled = bool(getattr(memory_debug, "remote_enabled", False))
+    remote_error = getattr(memory_debug, "remote_error", None)
+    sqlite_path = getattr(memory_debug, "path", "N/D")
+
+    sd1, sd2 = st.columns(2)
+    sd1.metric("Supabase remoto", "ACTIVO" if remote_enabled else "INACTIVO")
+    sd2.metric("Fallback SQLite", "DISPONIBLE")
+
+    st.write("**Remote enabled:**", remote_enabled)
+    st.write("**Remote error:**", remote_error if remote_error else "Sin error registrado")
+    st.write("**SQLite path:**", str(sqlite_path))
+    st.caption(
+        "Este bloque es solo de diagnóstico y no muestra valores secretos. "
+        "Si Supabase falla, NEXUS puede seguir funcionando con SQLite local, pero esa memoria "
+        "puede perderse cuando Streamlit reinicia la instancia."
+    )
+    st.divider()
+
     st.markdown("**Embudo de evidencia v0.3.0:**")
     st.markdown(
         "1. Universo fijo de 8 pares y relaciones dirigidas.  \n"
