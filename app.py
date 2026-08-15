@@ -188,7 +188,7 @@ def analyze(close: pd.DataFrame):
 
     validation_returns = close.pct_change(fill_method=None)
 
-graph = ScientificValidationEngine().validate_graph(
+    graph = ScientificValidationEngine().validate_graph(
     validation_returns,
     graph,
     family_trials=len(graph),
