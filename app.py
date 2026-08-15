@@ -18,7 +18,7 @@ from nexus_fx.intelligence import (
     NetworkStressEngine,
     RegimeEngine,
 )
-
+from nexus_fx.validation import ScientificValidationEngine
 APP_VERSION = "0.3.0"
 INTELLIGENCE_VERSION = ENGINE_VERSION
 
@@ -185,6 +185,14 @@ def analyze(close: pd.DataFrame):
         raise
         graph = pd.DataFrame(columns=CausalGraphEngine.COLUMNS)
         graph_warning = f"Motor multietapa desactivado por seguridad: {type(exc).__name__}: {exc}"
+
+    validation_returns = close.pct_change(fill_method=None)
+
+graph = ScientificValidationEngine().validate_graph(
+    validation_returns,
+    graph,
+    family_trials=len(graph),
+)
 
     return latent, regime, graph, divergences, triangles, stress, graph_warning
 
